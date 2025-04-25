@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/LogicalView/Core/LVElement.h"
+#include "llvm/DebugInfo/CodeView/EnumTables.h"
 #include "llvm/DebugInfo/LogicalView/Core/LVReader.h"
 #include "llvm/DebugInfo/LogicalView/Core/LVScope.h"
 #include "llvm/DebugInfo/LogicalView/Core/LVSymbol.h"
@@ -19,6 +20,23 @@
 using namespace llvm;
 using namespace llvm::codeview;
 using namespace llvm::logicalview;
+
+StringRef LVSourceLanguage::getName() const {
+  if (!isValid())
+    return {};
+  switch (Language.index()) {
+  case 1: // DWARF
+    return llvm::dwarf::LanguageString(
+        std::get<llvm::dwarf::SourceLanguage>(Language));
+  case 2: // CodeView
+  {
+    static auto LangNames = llvm::codeview::getSourceLanguageNames();
+    return LangNames[std::get<llvm::codeview::SourceLanguage>(Language)].Name;
+  }
+  default:
+    llvm_unreachable("Unsupported language");
+  }
+}
 
 #define DEBUG_TYPE "Element"
 
