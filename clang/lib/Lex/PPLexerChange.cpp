@@ -92,16 +92,10 @@ bool Preprocessor::EnterSourceFile(FileID FID, ConstSearchDirIterator CurDir,
   }
 
   Lexer *TheLexer = new Lexer(FID, *InputFile, *this, IsFirstIncludeOfFile);
-  if (getPreprocessorOpts().DependencyDirectivesForFile &&
-      FID != PredefinesFileID) {
-    if (OptionalFileEntryRef File = SourceMgr.getFileEntryRefForID(FID)) {
-      if (std::optional<ArrayRef<dependency_directives_scan::Directive>>
-              DepDirectives =
-                  getPreprocessorOpts().DependencyDirectivesForFile(*File)) {
-        TheLexer->DepDirectives = *DepDirectives;
-      }
-    }
-  }
+  if (GetDependencyDirectives && FID != PredefinesFileID)
+    if (OptionalFileEntryRef File = SourceMgr.getFileEntryRefForID(FID))
+      if (auto MaybeDepDirectives = (*GetDependencyDirectives)(*File))
+        TheLexer->DepDirectives = *MaybeDepDirectives;
 
   EnterSourceFileWithLexer(TheLexer, CurDir);
   return false;
@@ -308,7 +302,7 @@ void Preprocessor::diagnoseMissingHeaderInUmbrellaDir(const Module &Mod) {
     // Check whether this entry has an extension typically associated with
     // headers.
     if (!StringSwitch<bool>(llvm::sys::path::extension(Entry->path()))
-             .Cases(".h", ".H", ".hh", ".hpp", true)
+             .Cases({".h", ".H", ".hh", ".hpp"}, true)
              .Default(false))
       continue;
 
@@ -447,7 +441,7 @@ bool Preprocessor::HandleEndOfFile(Token &Result, bool isEndOfMacro) {
       assert(CurLexer && "Got EOF but no current lexer set!");
       Result.startToken();
       CurLexer->FormTokenWithChars(Result, CurLexer->BufferEnd, tok::eof);
-      CurLexer.reset();
+      PendingDestroyLexers.push_back(std::move(CurLexer));
 
       CurPPLexer = nullptr;
       recomputeCurLexerKind();
@@ -564,9 +558,17 @@ bool Preprocessor::HandleEndOfFile(Token &Result, bool isEndOfMacro) {
         << PPOpts.PCHThroughHeader << 0;
   }
 
-  if (!isIncrementalProcessingEnabled())
-    // We're done with lexing.
-    CurLexer.reset();
+  if (!isIncrementalProcessingEnabled()) {
+    // We're done with lexing. If we're inside a nested Lex call (LexLevel > 0),
+    // defer destruction of the lexer until Lex returns to avoid use-after-free
+    // when HandleEndOfFile is called from within Lexer methods that still need
+    // to access their members after this function returns.
+    if (LexLevel > 0 && CurLexer) {
+      PendingDestroyLexers.push_back(std::move(CurLexer));
+    } else {
+      CurLexer.reset();
+    }
+  }
 
   if (!isIncrementalProcessingEnabled())
     CurPPLexer = nullptr;
@@ -717,7 +719,7 @@ void Preprocessor::EnterSubmodule(Module *M, SourceLocation ImportLoc,
   ModMap.resolveConflicts(M, /*Complain=*/false);
 
   // If this is the first time we've entered this module, set up its state.
-  auto R = Submodules.insert(std::make_pair(M, SubmoduleState()));
+  auto R = Submodules.try_emplace(M);
   auto &State = R.first->second;
   bool FirstTime = R.second;
   if (FirstTime) {

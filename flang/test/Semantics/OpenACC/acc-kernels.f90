@@ -37,6 +37,17 @@ program openacc_kernels_validity
   !$acc kernels async(async1)
   !$acc end kernels
 
+  !ERROR: At most one ASYNC clause can appear on the KERNELS directive or in group separated by the DEVICE_TYPE clause
+  !$acc kernels async(async1) async(2)
+  !$acc end kernels
+
+  !$acc kernels async(async1) device_type(multicore) async(2) ! ok
+  !$acc end kernels
+
+  !ERROR: At most one ASYNC clause can appear on the KERNELS directive or in group separated by the DEVICE_TYPE clause
+  !$acc kernels async(async1) device_type(multicore) async(2) async(3)
+  !$acc end kernels
+
   !$acc kernels wait(wait1)
   !$acc end kernels
 
@@ -166,14 +177,14 @@ program openacc_kernels_validity
 
   !$acc kernels device_type(*) async
   do i = 1, N
-    a(i) = 3.14
+    a(i) = 3.14d0
   end do
   !$acc end kernels
 
   !ERROR: Clause IF is not allowed after clause DEVICE_TYPE on the KERNELS directive
   !$acc kernels device_type(*) if(.TRUE.)
   do i = 1, N
-    a(i) = 3.14
+    a(i) = 3.14d0
   end do
   !$acc end kernels
 

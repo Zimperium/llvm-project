@@ -16,14 +16,62 @@
 #include "SPIRVRegisterBankInfo.h"
 #include "SPIRVRegisterInfo.h"
 #include "SPIRVSubtarget.h"
-#include "SPIRVTargetMachine.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetLowering.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
 
 #define DEBUG_TYPE "spirv-lower"
 
 using namespace llvm;
+
+SPIRVTargetLowering::SPIRVTargetLowering(const TargetMachine &TM,
+                                         const SPIRVSubtarget &ST)
+    : TargetLowering(TM, ST), STI(ST) {
+  // Even with SPV_ALTERA_arbitrary_precision_integers enabled, atomic sizes are
+  // limited by atomicrmw xchg operation, which only supports operand up to 64
+  // bits wide, as defined in SPIR-V legalizer. Currently, spirv-val doesn't
+  // consider 128-bit OpTypeInt as valid either.
+  setMaxAtomicSizeInBitsSupported(64);
+  setMinCmpXchgSizeInBits(8);
+}
+
+// Returns true of the types logically match, as defined in
+// https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpCopyLogical.
+static bool typesLogicallyMatch(const SPIRVType *Ty1, const SPIRVType *Ty2,
+                                SPIRVGlobalRegistry &GR) {
+  if (Ty1->getOpcode() != Ty2->getOpcode())
+    return false;
+
+  if (Ty1->getNumOperands() != Ty2->getNumOperands())
+    return false;
+
+  if (Ty1->getOpcode() == SPIRV::OpTypeArray) {
+    // Array must have the same size.
+    if (Ty1->getOperand(2).getReg() != Ty2->getOperand(2).getReg())
+      return false;
+
+    SPIRVType *ElemType1 = GR.getSPIRVTypeForVReg(Ty1->getOperand(1).getReg());
+    SPIRVType *ElemType2 = GR.getSPIRVTypeForVReg(Ty2->getOperand(1).getReg());
+    return ElemType1 == ElemType2 ||
+           typesLogicallyMatch(ElemType1, ElemType2, GR);
+  }
+
+  if (Ty1->getOpcode() == SPIRV::OpTypeStruct) {
+    for (unsigned I = 1; I < Ty1->getNumOperands(); I++) {
+      SPIRVType *ElemType1 =
+          GR.getSPIRVTypeForVReg(Ty1->getOperand(I).getReg());
+      SPIRVType *ElemType2 =
+          GR.getSPIRVTypeForVReg(Ty2->getOperand(I).getReg());
+      if (ElemType1 != ElemType2 &&
+          !typesLogicallyMatch(ElemType1, ElemType2, GR))
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
 
 unsigned SPIRVTargetLowering::getNumRegistersForCallingConv(
     LLVMContext &Context, CallingConv::ID CC, EVT VT) const {
@@ -54,10 +102,10 @@ MVT SPIRVTargetLowering::getRegisterTypeForCallingConv(LLVMContext &Context,
   return getRegisterType(Context, VT);
 }
 
-bool SPIRVTargetLowering::getTgtMemIntrinsic(IntrinsicInfo &Info,
-                                             const CallInst &I,
-                                             MachineFunction &MF,
-                                             unsigned Intrinsic) const {
+void SPIRVTargetLowering::getTgtMemIntrinsic(
+    SmallVectorImpl<IntrinsicInfo> &Infos, const CallBase &I,
+    MachineFunction &MF, unsigned Intrinsic) const {
+  IntrinsicInfo Info;
   unsigned AlignIdx = 3;
   switch (Intrinsic) {
   case Intrinsic::spv_load:
@@ -73,13 +121,12 @@ bool SPIRVTargetLowering::getTgtMemIntrinsic(IntrinsicInfo &Info,
     Info.memVT = MVT::i64;
     // TODO: take into account opaque pointers (don't use getElementType).
     // MVT::getVT(PtrTy->getElementType());
-    return true;
-    break;
+    Infos.push_back(Info);
+    return;
   }
   default:
     break;
   }
-  return false;
 }
 
 std::pair<unsigned, const TargetRegisterClass *>
@@ -113,14 +160,12 @@ static void doInsertBitcast(const SPIRVSubtarget &STI, MachineRegisterInfo *MRI,
                             SPIRVType *NewPtrType) {
   MachineIRBuilder MIB(I);
   Register NewReg = createVirtualRegister(NewPtrType, &GR, MRI, MIB.getMF());
-  bool Res = MIB.buildInstr(SPIRV::OpBitcast)
-                 .addDef(NewReg)
-                 .addUse(GR.getSPIRVTypeID(NewPtrType))
-                 .addUse(OpReg)
-                 .constrainAllUses(*STI.getInstrInfo(), *STI.getRegisterInfo(),
-                                   *STI.getRegBankInfo());
-  if (!Res)
-    report_fatal_error("insert validation bitcast: cannot constrain all uses");
+  MIB.buildInstr(SPIRV::OpBitcast)
+      .addDef(NewReg)
+      .addUse(GR.getSPIRVTypeID(NewPtrType))
+      .addUse(OpReg)
+      .constrainAllUses(*STI.getInstrInfo(), *STI.getRegisterInfo(),
+                        *STI.getRegBankInfo());
   I.getOperand(OpIdx).setReg(NewReg);
 }
 
@@ -374,6 +419,9 @@ void SPIRVTargetLowering::finalizeLowering(MachineFunction &MF) const {
         // implies that %Op is a pointer to <ResType>
       case SPIRV::OpLoad:
         // OpLoad <ResType>, ptr %Op implies that %Op is a pointer to <ResType>
+        if (enforcePtrTypeCompatibility(MI, 2, 0))
+          break;
+
         validatePtrTypes(STI, MRI, GR, MI, 2,
                          GR.getSPIRVTypeForVReg(MI.getOperand(0).getReg()));
         break;
@@ -390,6 +438,7 @@ void SPIRVTargetLowering::finalizeLowering(MachineFunction &MF) const {
         break;
       case SPIRV::OpPtrCastToGeneric:
       case SPIRV::OpGenericCastToPtr:
+      case SPIRV::OpGenericCastToPtrExplicit:
         validateAccessChain(STI, MRI, GR, MI);
         break;
       case SPIRV::OpPtrAccessChain:
@@ -529,4 +578,82 @@ void SPIRVTargetLowering::finalizeLowering(MachineFunction &MF) const {
   }
   ProcessedMF.insert(&MF);
   TargetLowering::finalizeLowering(MF);
+}
+
+// Modifies either operand PtrOpIdx or OpIdx so that the pointee type of
+// PtrOpIdx matches the type for operand OpIdx. Returns true if they already
+// match or if the instruction was modified to make them match.
+bool SPIRVTargetLowering::enforcePtrTypeCompatibility(
+    MachineInstr &I, unsigned int PtrOpIdx, unsigned int OpIdx) const {
+  SPIRVGlobalRegistry &GR = *STI.getSPIRVGlobalRegistry();
+  SPIRVType *PtrType = GR.getResultType(I.getOperand(PtrOpIdx).getReg());
+  SPIRVType *PointeeType = GR.getPointeeType(PtrType);
+  SPIRVType *OpType = GR.getResultType(I.getOperand(OpIdx).getReg());
+
+  if (PointeeType == OpType)
+    return true;
+
+  if (typesLogicallyMatch(PointeeType, OpType, GR)) {
+    // Apply OpCopyLogical to OpIdx.
+    if (I.getOperand(OpIdx).isDef() &&
+        insertLogicalCopyOnResult(I, PointeeType)) {
+      return true;
+    }
+
+    llvm_unreachable("Unable to add OpCopyLogical yet.");
+    return false;
+  }
+
+  return false;
+}
+
+bool SPIRVTargetLowering::insertLogicalCopyOnResult(
+    MachineInstr &I, SPIRVType *NewResultType) const {
+  MachineRegisterInfo *MRI = &I.getMF()->getRegInfo();
+  SPIRVGlobalRegistry &GR = *STI.getSPIRVGlobalRegistry();
+
+  Register NewResultReg =
+      createVirtualRegister(NewResultType, &GR, MRI, *I.getMF());
+  Register NewTypeReg = GR.getSPIRVTypeID(NewResultType);
+
+  assert(llvm::size(I.defs()) == 1 && "Expected only one def");
+  MachineOperand &OldResult = *I.defs().begin();
+  Register OldResultReg = OldResult.getReg();
+  MachineOperand &OldType = *I.uses().begin();
+  Register OldTypeReg = OldType.getReg();
+
+  OldResult.setReg(NewResultReg);
+  OldType.setReg(NewTypeReg);
+
+  MachineIRBuilder MIB(*I.getNextNode());
+  MIB.buildInstr(SPIRV::OpCopyLogical)
+      .addDef(OldResultReg)
+      .addUse(OldTypeReg)
+      .addUse(NewResultReg)
+      .constrainAllUses(*STI.getInstrInfo(), *STI.getRegisterInfo(),
+                        *STI.getRegBankInfo());
+  return true;
+}
+
+TargetLowering::AtomicExpansionKind
+SPIRVTargetLowering::shouldExpandAtomicRMWInIR(const AtomicRMWInst *RMW) const {
+  switch (RMW->getOperation()) {
+  case AtomicRMWInst::FAdd:
+  case AtomicRMWInst::FSub:
+  case AtomicRMWInst::FMin:
+  case AtomicRMWInst::FMax:
+    return AtomicExpansionKind::None;
+  case AtomicRMWInst::UIncWrap:
+  case AtomicRMWInst::UDecWrap:
+    return AtomicExpansionKind::CmpXChg;
+  default:
+    return TargetLowering::shouldExpandAtomicRMWInIR(RMW);
+  }
+}
+
+TargetLowering::AtomicExpansionKind
+SPIRVTargetLowering::shouldCastAtomicRMWIInIR(AtomicRMWInst *RMWI) const {
+  // TODO: Pointer operand should be cast to integer in atomicrmw xchg, since
+  // SPIR-V only supports atomic exchange for integer and floating-point types.
+  return AtomicExpansionKind::None;
 }
